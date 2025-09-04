@@ -13,9 +13,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:4200';
 
 // Enable CORS for Angular app
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: '*',
   optionsSuccessStatus: 200
 }));
+
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'src', 'assets', 'uploads');
