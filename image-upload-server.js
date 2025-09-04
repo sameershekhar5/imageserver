@@ -1,140 +1,160 @@
-const express = require('express');
-const multer = require('multer');
-const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
+/**
+ * Image Upload Server (Render-ready, no hardcoded ports)
+ * -----------------------------------------------------
+ * - Listens on process.env.PORT (Render injects this).
+ * - Binds to process.env.SERVER_HOST or "0.0.0.0".
+ * - CORS origins via process.env.FRONTEND_ORIGINS (CSV, "*", or regex between /slashes/).
+ * - Upload directory via process.env.UPLOAD_DIR (default: "src/assets/uploads").
+ * - File size limit via process.env.MAX_FILE_MB (default: 10 MB).
+ * - Endpoints:
+ *      GET  /                -> basic info
+ *      GET  /api/health      -> { ok: true }
+ *      GET  /api/ready       -> { ready: true }
+ *      POST /api/upload-image   (single file, field "image")
+ *      POST /api/upload-images  (multiple files, field "images")
+ *      GET  /assets/uploads/* -> serves uploaded files (static)
+ *
+ * Run locally:
+ *   npm install express multer cors
+ *   # PowerShell
+ *   $env:SERVER_HOST="0.0.0.0"; $env:PORT="3001"; $env:FRONTEND_ORIGINS="http://localhost:4200"; `
+ *   $env:UPLOAD_DIR="src/assets/uploads"; $env:MAX_FILE_MB="10"; node image-upload-server.js
+ *
+ * Render env vars (Web Service):
+ *   SERVER_HOST=0.0.0.0
+ *   FRONTEND_ORIGINS=https://your-frontend.example.com  (or "*" during testing)
+ *   UPLOAD_DIR=/app/src/assets/uploads   (or a mounted disk path)
+ *   MAX_FILE_MB=10
+ */
 
+const fs = require("fs");
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+
+// -------------------- Config (no hardcoded values) --------------------
+const PORT = parseInt(process.env.PORT || "3001", 10);         // Render sets this
+const HOST = process.env.SERVER_HOST || "0.0.0.0";              // 0.0.0.0 works on PaaS
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.resolve("src/assets/uploads");
+const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || "10", 10);
+
+// Ensure upload dir exists
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// -------------------- App & Middlewares --------------------
 const app = express();
-const PORT = 3001;
+app.use(express.json({ limit: `${MAX_FILE_MB}mb` }));
 
-// Get the server host from environment or default to localhost
-const SERVER_HOST = process.env.SERVER_HOST || 'localhost';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:4200';
+// ---- Dynamic CORS (CSV, *, or regex between /slashes/)
+const allowAll = FRONTEND_ORIGINS.length === 0 || FRONTEND_ORIGINS.includes("*");
 
-// Enable CORS for Angular app
-app.use(cors({
-  origin: '*',
-  optionsSuccessStatus: 200
+const isOriginAllowed = (origin) => {
+  if (allowAll) return true;              // if not set or "*" -> allow all
+  if (!origin) return false;              // curl/postman without Origin
+  return FRONTEND_ORIGINS.some(entry => {
+    if (entry.startsWith("/") && entry.endsWith("/")) {
+      const pattern = entry.slice(1, -1);
+      try { return new RegExp(pattern).test(origin); }
+      catch { return false; }
+    }
+    return origin === entry;
+  });
+};
+
+app.use(cors((req, cb) => {
+  const origin = req.header("Origin");
+  const ok = isOriginAllowed(origin);
+  cb(null, {
+    origin: ok,
+    credentials: true,
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
+    allowedHeaders: "Content-Type, Authorization, X-Requested-With"
+  });
 }));
 
-
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, 'src', 'assets', 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-  console.log('📁 Created uploads directory:', uploadsDir);
-}
-
-// Serve static files from uploads directory
-app.use('/assets/uploads', express.static(uploadsDir));
-
-// Configure multer for file uploads
+// -------------------- Multer (disk storage) --------------------
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const timestamp = Date.now();
-    const randomId = Math.random().toString(36).substring(2, 15);
-    const extension = path.extname(file.originalname);
-    const filename = `blog-image-${timestamp}-${randomId}${extension}`;
-    cb(null, filename);
+    const original = (file && file.originalname) ? file.originalname : "file";
+    const safe = original.replace(/[^\w.\-]/g, "_");
+    cb(null, Date.now() + "-" + safe);
   }
 });
 
-const upload = multer({ 
-  storage: storage,
-  fileFilter: (req, file, cb) => {
-    // Accept only image files
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed!'), false);
-    }
-  },
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  }
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_MB * 1024 * 1024 }
 });
 
-// Upload endpoint
-app.post('/api/upload-image', upload.single('image'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'No file uploaded' 
-      });
-    }
+// -------------------- Helpers --------------------
+const buildPublicUrl = (req, storedName) => {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}/assets/uploads/${encodeURIComponent(storedName)}`;
+};
 
-    const imageUrl = `http://${SERVER_HOST}:${PORT}/assets/uploads/${req.file.filename}`;
-    
-    console.log('✅ Image uploaded successfully:', {
-      filename: req.file.filename,
-      originalName: req.file.originalname,
+// -------------------- Routes --------------------
+app.get("/", (req, res) => {
+  res.status(200).json({
+    name: "Image Upload Server",
+    ok: true,
+    uploads: "/assets/uploads",
+    singleUploadEndpoint: "POST /api/upload-image (field 'image')",
+    multiUploadEndpoint: "POST /api/upload-images (field 'images')"
+  });
+});
+
+app.get("/api/health", (req, res) => res.status(200).json({ ok: true }));
+app.get("/api/ready",  (req, res) => res.status(200).json({ ready: true }));
+
+// Single file: field name "image"
+app.post("/api/upload-image", upload.single("image"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file received. Use field name 'image'." });
+  }
+  const url = buildPublicUrl(req, req.file.filename);
+  res.status(201).json({
+    message: "Uploaded",
+    file: {
+      fieldname: req.file.fieldname,
+      originalname: req.file.originalname,
+      mimetype: req.file.mimetype,
       size: req.file.size,
-      path: req.file.path,
-      url: imageUrl
-    });
-
-    res.json({
-      success: true,
-      url: imageUrl,
       filename: req.file.filename,
-      originalName: req.file.originalname,
-      size: req.file.size
-    });
-
-  } catch (error) {
-    console.error('❌ Upload error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to upload image' 
-    });
-  }
+      path: req.file.path,
+      url
+    }
+  });
 });
 
-// Get all uploaded images
-app.get('/api/images', (req, res) => {
-  try {
-    if (!fs.existsSync(uploadsDir)) {
-      return res.json({ images: [] });
-    }
-
-    const files = fs.readdirSync(uploadsDir)
-      .filter(file => {
-        const ext = path.extname(file).toLowerCase();
-        return ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext);
-      })
-      .map(file => {
-        const filePath = path.join(uploadsDir, file);
-        const stats = fs.statSync(filePath);
-        return {
-          filename: file,
-          url: `http://${SERVER_HOST}:${PORT}/assets/uploads/${file}`,
-          size: stats.size,
-          created: stats.birthtime,
-          modified: stats.mtime
-        };
-      })
-      .sort((a, b) => new Date(b.created) - new Date(a.created)); // Sort by newest first
-
-    res.json({ images: files });
-
-  } catch (error) {
-    console.error('❌ Error reading images:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to read images' 
-    });
+// Multiple files: field name "images"
+app.post("/api/upload-images", upload.array("images", 10), (req, res) => {
+  const files = (req.files || []).map(f => ({
+    fieldname: f.fieldname,
+    originalname: f.originalname,
+    mimetype: f.mimetype,
+    size: f.size,
+    filename: f.filename,
+    path: f.path,
+    url: buildPublicUrl(req, f.filename)
+  }));
+  if (files.length === 0) {
+    return res.status(400).json({ error: "No files received. Use field name 'images'." });
   }
+  res.status(201).json({ message: "Uploaded", files });
 });
 
 // Delete image endpoint
 app.delete('/api/images/:filename', (req, res) => {
   try {
     const filename = req.params.filename;
-    const filePath = path.join(uploadsDir, filename);
+    const filePath = path.join(UPLOAD_DIR, filename);
 
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ 
@@ -159,39 +179,36 @@ app.delete('/api/images/:filename', (req, res) => {
     });
   }
 });
+// Serve static uploads
+app.use("/assets/uploads", express.static(UPLOAD_DIR, {
+  fallthrough: true,
+  index: false,
+  immutable: false,
+  maxAge: "1h"
+}));
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Image upload server is running',
-    uploadsDir: uploadsDir
-  });
+// 404
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'File size too large. Maximum size is 5MB.' 
-      });
-    }
+// Error handler (includes Multer file limit error)
+app.use((err, req, res, next) => {
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({ error: `File too large. Max ${MAX_FILE_MB} MB.` });
   }
-  
-  console.error('❌ Server error:', error);
-  res.status(500).json({ 
-    success: false, 
-    error: error.message || 'Internal server error' 
-  });
+  console.error(err);
+  res.status(500).json({ error: "Internal Server Error" });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Image upload server running on http://${SERVER_HOST}:${PORT}`);
-  console.log(`📁 Upload directory: ${uploadsDir}`);
-  console.log(`🔗 Test health: http://${SERVER_HOST}:${PORT}/api/health`);
-  console.log(`🌐 CORS enabled for: ${FRONTEND_URL}`);
+// -------------------- Start & Graceful Shutdown --------------------
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Server listening on http://${HOST}:${PORT}`);
 });
 
-module.exports = app;
+const shutdown = (signal) => () => {
+  console.log(`Received ${signal}. Shutting down...`);
+  server.close(() => process.exit(0));
+};
+process.on("SIGINT", shutdown("SIGINT"));
+process.on("SIGTERM", shutdown("SIGTERM"));
